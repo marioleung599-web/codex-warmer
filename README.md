@@ -11,8 +11,6 @@
 
 ## 配置与维护
 
-运行所需的敏感配置通过 GitHub Actions Secrets 保存，不应放进代码或日志。配置失效时需由仓库所有者更新。
-
 在 Actions 页面查看执行结果；通过工作流菜单的 Disable workflow 暂停，Enable workflow 恢复。定时执行可能因平台调度而延迟。
 
 ## 许可证
