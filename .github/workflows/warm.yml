@@ -1,7 +1,6 @@
 name: codex-window-warmer
 
 # Adapted from viseshb/claude-codex-warmer (MIT).
-# Read real quota every 30 minutes; an upcoming reset is activated at reset + 60s.
 on:
   schedule:
     - cron: "11,41 * * * *"
@@ -11,15 +10,13 @@ concurrency:
   group: codex-window-warmer
   cancel-in-progress: false
 
+permissions: {}
+
 jobs:
   warm-codex:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-
       - name: Restore Codex authentication
         id: restore
         env:
@@ -41,156 +38,114 @@ jobs:
       - name: Install official Codex CLI
         run: npm install -g @openai/codex@0.144.1
 
-      - name: Check quota and activate when due
+      - name: Check or send
+        shell: bash
         run: |
-          node --input-type=module <<'JS'
-          import { spawn, execFile } from 'node:child_process';
+          node --input-type=module <<'JS' | tee -a "$GITHUB_STEP_SUMMARY"
+          import childProcess from 'node:child_process';
+          import fs from 'node:fs';
           import { createInterface } from 'node:readline';
+          import { homedir } from 'node:os';
+          import { join } from 'node:path';
           import { setTimeout as sleep } from 'node:timers/promises';
-          import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 
-          export const exec = (file, args, options) => new Promise((resolve, reject) => {
-            const child = execFile(file, args, options, (error, stdout) =>
-              error || child.killed ? reject(error || new Error('Command timed out.')) : resolve({ stdout }));
-            child.stdin.end();
-          });
-          const WINDOW = 5 * 60 * 60;
-          const INTERVAL = 30 * 60;
-          const STATE = '.state/last-activation.json';
-          const now = () => Date.now() / 1000;
-          const stamp = seconds => new Date(seconds * 1000).toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }) + ' GMT+8';
-
-          function report(message) {
-            console.log(message);
-            if (process.env.GITHUB_STEP_SUMMARY)
-              appendFileSync(process.env.GITHUB_STEP_SUMMARY, '- ' + message + '\n');
-          }
-
-          export function parseQuota(result) {
-            const limits = result.rateLimitsByLimitId ? result.rateLimitsByLimitId.codex : result.rateLimits;
-            const primary = limits?.primary;
-            if (primary?.windowDurationMins !== 300 || !Number.isInteger(primary.resetsAt) || primary.resetsAt <= 0 ||
-                !Number.isFinite(primary.usedPercent) || primary.usedPercent < 0 || primary.usedPercent > 100)
-              throw new Error('Missing valid five-hour Codex quota; refusing to guess a reset time.');
-            return { resetAt: primary.resetsAt, usedPercent: primary.usedPercent };
-          }
-
-          function readQuota() {
-            return new Promise((resolve, reject) => {
-              const child = spawn('codex', ['app-server'], { stdio: ['pipe', 'pipe', 'ignore'] });
-              const lines = createInterface({ input: child.stdout });
-              let done = false;
-              const timer = setTimeout(() => finish(new Error('Account quota query timed out.')), 60000);
-              function finish(error, value) {
-                if (done) return;
-                done = true;
-                clearTimeout(timer);
-                lines.close();
-                child.kill();
-                const cleanup = setTimeout(() => child.kill('SIGKILL'), 5000);
-                cleanup.unref();
-                child.once('exit', () => clearTimeout(cleanup));
-                error ? reject(error) : resolve(value);
-              }
-              const write = message => child.stdin.write(JSON.stringify(message) + '\n');
-              child.on('error', finish);
-              child.stdin.on('error', finish);
-              child.on('exit', () => finish(new Error('Account quota client stopped.')));
-              lines.on('line', line => {
-                let message;
-                try { message = JSON.parse(line); } catch { return; }
-                if (done || (message.id !== 1 && message.id !== 2)) return;
-                if (message.error) return finish(new Error('Account quota request failed.'));
-                if (message.id === 1) {
-                  write({ method: 'initialized', params: {} });
-                  write({ id: 2, method: 'account/rateLimits/read' });
-                } else {
-                  try { finish(null, parseQuota(message.result)); } catch (error) { finish(error); }
-                }
-              });
-              write({ id: 1, method: 'initialize', params: { clientInfo: { name: 'codex_quota_check', version: '1.0.0' } } });
-            });
-          }
-
-          export function decide(quota, activatedAt, checkedAt) {
-            const remaining = quota.resetAt - checkedAt;
-            if (remaining <= 0)
-              return activatedAt >= quota.resetAt
-                ? { due: null, reason: 'This reset was already activated; server metadata is stale.' }
-                : { due: checkedAt, reason: 'The server reset time has passed; activate now.' };
-            // Compare with the current SERVER window, never with last activation + five hours.
-            const alreadyActivated = activatedAt >= quota.resetAt - WINDOW;
-            // A window opened during the latest check interval is fresh, even if already used elsewhere.
-            const fresh = remaining >= WINDOW - INTERVAL && remaining <= WINDOW;
-            if (!alreadyActivated && (activatedAt > 0 || fresh))
-              return { due: checkedAt, reason: 'A new quota window is available; activate now.' };
-            if (remaining <= INTERVAL)
-              return { due: quota.resetAt + 60, reason: 'Reset is within 30 minutes; activate at reset plus one minute.' };
-            return { due: null, reason: 'No activation is due; wait for the next scheduled check.' };
-          }
-
-          async function retry(label, action) {
-            for (let attempt = 1; ; attempt++) {
+          export async function retry(label, action, wait = sleep) {
+            for (let attempt = 1; attempt <= 4; attempt++) {
               try { return await action(); }
               catch (error) {
-                if (attempt === 3) throw error;
-                report(label + ' failed; retrying in 10 seconds.');
-                await sleep(10000);
+                console.log(`${label}: attempt ${attempt}/4 failed.`);
+                if (attempt === 4) throw error;
+                console.log('Retrying in 30 seconds.');
+                await wait(30000);
               }
             }
           }
 
-          async function saveActivation(completedAt) {
-            mkdirSync('.state', { recursive: true });
-            writeFileSync(STATE, JSON.stringify(completedAt) + '\n');
-            const git = (...args) => exec('git', args, { timeout: 30000 });
-            await git('config', 'user.name', 'github-actions[bot]');
-            await git('config', 'user.email', 'github-actions[bot]@users.noreply.github.com');
-            await git('add', STATE);
-            await git('commit', '-m', 'chore: record successful activation');
-            await retry('Saving activation', async () => {
-              await git('pull', '--rebase');
-              await git('push');
+          export async function readQuota() {
+            const deadline = AbortSignal.timeout(60000);
+            // Let the official CLI maintain the managed login before reading its access token.
+            const child = childProcess.spawn('codex', ['app-server'], {
+              stdio: ['pipe', 'pipe', 'ignore'], signal: deadline
             });
-          }
-
-          export async function run(quota, activatedAt, { clock = now, wait = sleep, send, save, log = report }) {
-            const checkedAt = clock();
-            const { due, reason } = decide(quota, activatedAt, checkedAt);
-            log('Checked at: ' + stamp(checkedAt));
-            log('Five-hour quota remaining: ' + (100 - quota.usedPercent) + '%');
-            log('Server reset time: ' + stamp(quota.resetAt));
-            log('Decision: ' + reason);
-            if (due === null) return 'skip';
-            log('Request scheduled for: ' + stamp(due));
-            await wait(Math.max(0, due - clock()) * 1000);
-            await send();
-            const completedAt = clock();
-            await save(completedAt);
-            log('Activation succeeded at: ' + stamp(completedAt));
-            return 'sent';
-          }
-
-          export async function main() {
-            const activatedAt = existsSync(STATE) ? JSON.parse(readFileSync(STATE, 'utf8')) : 0;
-            if (!Number.isFinite(activatedAt) || activatedAt < 0 || activatedAt > now())
-              throw new Error('Invalid successful activation record.');
-            await run(await readQuota(), activatedAt, {
-              save: saveActivation,
-              send: async () => {
-                await retry('Activation request', async () => {
-                  const result = await exec('codex', [
-                    'exec', '--ephemeral', '--sandbox', 'read-only', '--skip-git-repo-check',
-                    '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="low"',
-                    'Reply only with hi. Do not use tools or read any files.'
-                  ], { timeout: 120000 });
-                  if (!result.stdout.trim()) throw new Error('Codex returned no reply.');
-                  report('Response: ' + result.stdout.trim().slice(0, 200));
+            const lines = createInterface({ input: child.stdout });
+            const write = message => child.stdin.write(JSON.stringify(message) + '\n');
+            try {
+              await new Promise((resolve, reject) => {
+                child.on('error', reject);
+                child.stdin.on('error', reject);
+                child.once('exit', () => reject(new Error('Login client stopped before completing.')));
+                lines.on('line', line => {
+                  let message;
+                  try { message = JSON.parse(line); } catch { return; }
+                  if (message.id !== 1 && message.id !== 2) return;
+                  if (message.error) return reject(new Error('Codex login refresh failed.'));
+                  if (message.id === 1) {
+                    write({ method: 'initialized', params: {} });
+                    write({ id: 2, method: 'account/read', params: { refreshToken: true } });
+                  } else resolve();
                 });
+                write({ id: 1, method: 'initialize', params: {
+                  clientInfo: { name: 'codex_window_warmer', version: '2.0.0' }
+                } });
+              });
+            } finally {
+              lines.close();
+              child.kill('SIGKILL');
+            }
+
+            let tokens;
+            try { tokens = JSON.parse(fs.readFileSync(join(homedir(), '.codex', 'auth.json'), 'utf8')).tokens; }
+            catch { throw new Error('Could not read Codex authentication.'); }
+            if (!tokens?.access_token || !tokens.account_id)
+              throw new Error('Codex authentication is missing the account or access token.');
+            const response = await fetch('https://chatgpt.com/backend-api/wham/usage', {
+              signal: deadline,
+              headers: {
+                Authorization: `Bearer ${tokens.access_token}`,
+                'chatgpt-account-id': tokens.account_id
               }
             });
+            if (!response.ok) throw new Error(`Quota query failed: HTTP ${response.status}.`);
+            const quota = (await response.json()).rate_limit?.primary_window;
+            if (quota?.limit_window_seconds !== 18000 ||
+                !Number.isFinite(quota.reset_after_seconds) || quota.reset_after_seconds < 0)
+              throw new Error('The server did not return valid five-hour reset seconds.');
+            return quota.reset_after_seconds;
           }
-          await main();
+
+          export function sendRequest() {
+            return new Promise((resolve, reject) => {
+              const child = childProcess.execFile('codex', [
+                'exec', '--ephemeral', '--sandbox', 'read-only', '--skip-git-repo-check',
+                '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="low"',
+                'Reply only with hi. Do not use tools or read any files.'
+              ], { timeout: 120000 }, (error, stdout) => {
+                if (error || child.killed)
+                  return reject(new Error(child.killed ? 'Codex request timed out.' : 'Codex request failed.'));
+                const reply = stdout.trim();
+                if (!reply) return reject(new Error('Codex returned an empty reply.'));
+                resolve(reply);
+              });
+              child.stdin.end();
+            });
+          }
+
+          export async function main(event, { query = readQuota, send = sendRequest, wait = sleep } = {}) {
+            if (event !== 'workflow_dispatch') {
+              const remaining = await retry('Quota query', query, wait);
+              console.log(`Seconds until five-hour reset: ${remaining}`);
+              if (remaining < 17700) {
+                console.log('Timer is running; skipped.');
+                return;
+              }
+              console.log('Timer is within the five-minute margin; sending.');
+            } else console.log('Manual run; sending.');
+
+            const reply = await retry('Codex request', send, wait);
+            console.log('Response: ' + reply.slice(0, 200));
+            console.log('Request succeeded.');
+          }
+          await main(process.env.GITHUB_EVENT_NAME);
           JS
 
       - name: Save authentication only if refreshed
