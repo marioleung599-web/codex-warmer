@@ -1,14 +1,14 @@
 name: codex-window-warmer
 
 # Adapted from viseshb/claude-codex-warmer (MIT).
-# Check every 30 minutes; send when the last successful request is >= 5 hours old.
+# Check real quota every 30 minutes; when reset is near, wait until reset + 60s.
 on:
   schedule:
     - cron: "11,41 * * * *"
   workflow_dispatch:
     inputs:
       check_only:
-        description: "Only check the five-hour timer; do not send a request"
+        description: "Only read quota and show the decision; do not wait or send a request"
         required: false
         default: false
         type: boolean
@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 env:
-  WARM_INTERVAL_SECONDS: "18000"
+  CHECK_INTERVAL_SECONDS: "1800"
   CODEX_CLI_VERSION: "0.144.1"
 
 concurrency:
@@ -27,65 +27,17 @@ concurrency:
 jobs:
   warm-codex:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     permissions:
       contents: write
     env:
       GH_PAT: ${{ secrets.GH_PAT }}
+      CHECK_ONLY: ${{ inputs.check_only || false }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check five-hour timer
-        id: check
-        env:
-          CHECK_ONLY: ${{ inputs.check_only || false }}
-          TRIGGER: ${{ github.event_name }}
-        run: |
-          now=$(date +%s)
-          last=0
-          if [ -f .state/codex-last-warm.txt ]; then
-            last=$(cat .state/codex-last-warm.txt)
-            case "$last" in
-              (''|*[!0-9]*) echo "::error::Invalid last-send timestamp; refusing to send."; exit 1 ;;
-            esac
-          fi
-          if [ "$last" -gt "$now" ]; then
-            echo "::error::Last-send timestamp is in the future; refusing to send."
-            exit 1
-          fi
-          elapsed=$((now - last))
-          remaining=$((WARM_INTERVAL_SECONDS - elapsed))
-          send=false
-          if [ "$remaining" -le 0 ]; then
-            remaining=0
-            reason="Five hours elapsed; request is due."
-            if [ "$CHECK_ONLY" = "true" ]; then
-              reason="Request is due, but this is a check-only run."
-            else
-              send=true
-            fi
-          else
-            reason="Waiting: ${remaining}s remain until the next request."
-          fi
-          echo "$reason"
-          echo "send=$send" >> "$GITHUB_OUTPUT"
-          {
-            echo "## Connection check"
-            echo "- Trigger: $TRIGGER"
-            echo "- Checked at: $(TZ=Asia/Shanghai date '+%F %T %Z')"
-            echo "- Schedule: every hour at :11 and :41 (GitHub may delay scheduling)."
-            echo "- Minimum request interval: 18000 seconds / 5 hours."
-            if [ "$last" -gt 0 ]; then
-              echo "- Last successful request: $(TZ=Asia/Shanghai date -d "@$last" '+%F %T %Z')"
-              echo "- Elapsed: ${elapsed}s."
-            else
-              echo "- Last successful request: none recorded."
-            fi
-            echo "- Decision: $reason"
-          } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Restore Codex auth
-        if: steps.check.outputs.send == 'true'
+        id: restore
         env:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
         run: |
@@ -98,105 +50,239 @@ jobs:
           chmod 600 "$HOME/.codex/auth.json"
 
       - uses: actions/setup-node@v4
-        if: steps.check.outputs.send == 'true'
         with:
           node-version: "20"
 
-      - name: Install Codex CLI
-        if: steps.check.outputs.send == 'true'
+      - name: Install official Codex CLI
         run: npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 
-      - name: Send warm-up prompt
-        id: warm
-        if: steps.check.outputs.send == 'true'
+      - name: Check real quota and activate after reset
+        id: check
         run: |
-          reply_file=$(mktemp)
-          trap 'rm -f "$reply_file"' EXIT
-          for attempt in 1 2 3; do
-            started=$(date +%s)
-            if codex exec --ephemeral --sandbox read-only --skip-git-repo-check -m gpt-5.6-sol \
-              -c model_reasoning_effort="low" "Reply only with hi. Do not use tools or read any files." > "$reply_file"; then
-              cat "$reply_file"
-              reply=$(tr -d '\r\n' < "$reply_file")
-              if [ "$reply" = "hi" ]; then
-                echo "sent_at=$started" >> "$GITHUB_OUTPUT"
-                echo "- Request: succeeded; response was hi." >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-              echo "::warning::Request returned an unexpected response."
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              echo "Attempt $attempt failed; retrying in 10 seconds."
-              sleep 10
-            fi
-          done
-          echo "::error::All three request attempts failed."
-          exit 1
+          python - <<'PY'
+          """Check the real quota; wait only when its reset is within one check interval."""
+          import json
+          import os
+          from pathlib import Path
+          import queue
+          import subprocess
+          import threading
+          import time
 
-      - name: Persist refreshed auth back to secret (best-effort)
-        id: persist_auth
-        if: ${{ always() && steps.check.outputs.send == 'true' && steps.warm.outcome != 'skipped' && env.GH_PAT != '' }}
-        continue-on-error: true
+
+          class LimitsClient:
+              def __init__(self):
+                  self.proc = subprocess.Popen(['codex', 'app-server'], stdin=subprocess.PIPE,
+                                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                               text=True, bufsize=1)
+                  self.responses = queue.Queue()
+                  self.sequence = 0
+                  def read():
+                      for line in self.proc.stdout:
+                          try:
+                              message = json.loads(line)
+                          except ValueError:
+                              continue
+                          if 'id' in message:
+                              self.responses.put(message)
+                      self.responses.put(None)
+                  threading.Thread(target=read, daemon=True).start()
+                  self.rpc('initialize', {'clientInfo': {'name': 'codex_quota_check', 'version': '1.0.0'}})
+                  self.proc.stdin.write(json.dumps({'method': 'initialized', 'params': {}}) + '\n')
+                  self.proc.stdin.flush()
+
+              def rpc(self, method, params=None):
+                  self.sequence += 1
+                  message = {'id': self.sequence, 'method': method}
+                  if params is not None:
+                      message['params'] = params
+                  self.proc.stdin.write(json.dumps(message) + '\n')
+                  self.proc.stdin.flush()
+                  until = time.monotonic() + 60
+                  while True:
+                      remaining = until - time.monotonic()
+                      if remaining <= 0:
+                          raise RuntimeError('Account quota query timed out')
+                      try:
+                          response = self.responses.get(timeout=remaining)
+                      except queue.Empty:
+                          raise RuntimeError('Account quota query timed out') from None
+                      if response is None:
+                          raise RuntimeError('Account quota client stopped')
+                      if response.get('id') != self.sequence:
+                          continue
+                      if 'error' in response:
+                          raise RuntimeError('Account quota query failed: ' + method)
+                      return response['result']
+
+              def read(self):
+                  result = self.rpc('account/rateLimits/read')
+                  buckets = result.get('rateLimitsByLimitId')
+                  limits = buckets.get('codex', {}) if buckets else result.get('rateLimits', {})
+                  primary = (limits or {}).get('primary') or {}
+                  if primary.get('windowDurationMins') != 300:
+                      raise RuntimeError('The server did not return a five-hour Codex quota')
+                  reset, used = primary.get('resetsAt'), primary.get('usedPercent')
+                  if isinstance(reset, bool) or not isinstance(reset, (int, float)) or reset <= 0:
+                      raise RuntimeError('Missing valid server reset time; no fallback request will be sent')
+                  if isinstance(used, bool) or not isinstance(used, (int, float)) or not 0 <= used <= 100:
+                      raise RuntimeError('Missing valid quota percentage')
+                  return {'resetAt': int(reset), 'usedPercent': used}
+
+              def close(self):
+                  if self.proc.poll() is None:
+                      self.proc.terminate()
+                  try:
+                      self.proc.wait(timeout=5)
+                  except subprocess.TimeoutExpired:
+                      self.proc.kill()
+                      self.proc.wait()
+
+
+          def read_limits():
+              client = LimitsClient()
+              try:
+                  return client.read()
+              finally:
+                  client.close()
+
+
+          def stamp(value):
+              from datetime import datetime, timezone, timedelta
+              return datetime.fromtimestamp(value, timezone(timedelta(hours=8))).strftime('%F %T GMT+8')
+
+
+          def report(message):
+              print(message, flush=True)
+              summary = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary, 'a', encoding='utf-8') as handle:
+                      handle.write('- ' + message + '\n')
+
+
+          def decide(limits, state, now, interval):
+              reset = limits['resetAt']
+              remaining = reset - now
+              observed = state.get('observedResetAt', 0)
+              handled = state.get('handledResetAt', 0)
+              activated = state.get('activatedWindowResetAt', 0)
+              if reset <= now:
+                  if reset <= handled:
+                      return None, 'This reset was already handled; server metadata has not advanced.'
+                  return now, 'The server reset time has passed; send now.'
+              if observed > handled and observed <= now and reset != observed:
+                  return now, 'The previously observed server reset has passed and a new window is reported; send now.'
+              # A tiny request may round to 0% used. Remember the activated window so a
+              # manual rerun cannot activate that same full-looking window again.
+              if limits['usedPercent'] == 0 and abs(remaining - 18000) <= 120 and reset != activated:
+                  if observed and observed <= handled and observed < reset:
+                      return None, 'This newly reported window was already activated after its reset.'
+                  return now, 'Quota is 100% available and the next reset is about five hours away; send now.'
+              if remaining <= interval:
+                  return reset + 60, 'Reset is within one check interval; wait until reset plus one minute.'
+              return None, 'Reset is more than one check interval away; finish and wait for the next scheduled check.'
+
+
+          def check(limits, state, save, send, now=time.time, sleep=time.sleep,
+                    interval=1800, check_only=False, read_after=read_limits, emit=report):
+              checked_at = now()
+              due, reason = decide(limits, state, checked_at, interval)
+              emit('Checked at: ' + stamp(checked_at))
+              emit('Five-hour quota remaining: ' + str(100 - limits['usedPercent']) + '%')
+              emit('Server reset time: ' + stamp(limits['resetAt']))
+              emit('Seconds until reset: ' + str(round(limits['resetAt'] - checked_at)))
+              emit('Decision: ' + reason)
+              if due is not None:
+                  emit('Request scheduled for: ' + stamp(due))
+              if check_only:
+                  emit('Check-only run: no request, no waiting, no state change.')
+                  return 'check_only'
+              previous_reset = state.get('observedResetAt', 0)
+              state['observedResetAt'] = limits['resetAt']
+              if due is None:
+                  if previous_reset != limits['resetAt']:
+                      save()
+                  return 'skip'
+              # One short-lived run sleeps at most one interval plus 60 seconds. It does
+              # not dispatch another workflow or keep a five-hour resident process.
+              while True:
+                  remaining = due - now()
+                  if remaining <= 0:
+                      break
+                  sleep(remaining)
+              emit('Starting the activation request at ' + stamp(now()))
+              sent_at = send()
+              if limits['resetAt'] <= sent_at:
+                  state['handledResetAt'] = limits['resetAt']
+              elif previous_reset and previous_reset <= sent_at:
+                  state['handledResetAt'] = max(state.get('handledResetAt', 0), previous_reset)
+              state['activatedWindowResetAt'] = limits['resetAt']
+              save()
+              emit('Request succeeded; response: hi.')
+              updated = read_after()
+              state['observedResetAt'] = updated['resetAt']
+              state['activatedWindowResetAt'] = updated['resetAt']
+              save()
+              emit('Next server reset time: ' + stamp(updated['resetAt']))
+              return 'sent'
+
+
+          def request_hi():
+              for attempt in range(3):
+                  started = time.time()
+                  try:
+                      result = subprocess.run(['codex', 'exec', '--ephemeral', '--sandbox', 'read-only',
+                          '--skip-git-repo-check', '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="low"',
+                          'Reply only with hi. Do not use tools or read any files.'],
+                          stdout=subprocess.PIPE, text=True, timeout=120)
+                  except subprocess.TimeoutExpired:
+                      result = None
+                  if result is not None and result.returncode == 0 and result.stdout.strip() == 'hi':
+                      return started
+                  if attempt < 2:
+                      report('Request failed; retrying in 10 seconds.')
+                      time.sleep(10)
+              raise RuntimeError('All three activation request attempts failed')
+
+
+          def main():
+              path = Path('.state/codex-quota-check.json')
+              state = json.loads(path.read_text()) if path.exists() else {}
+              for key in ('observedResetAt', 'handledResetAt', 'activatedWindowResetAt'):
+                  value = state.get(key, 0)
+                  if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                      raise RuntimeError('Invalid saved quota state')
+              def save():
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_text(json.dumps(state, indent=2) + '\n', encoding='utf-8')
+                  subprocess.run(['git', 'add', str(path)], check=True)
+                  changed = subprocess.run(['git', 'diff', '--cached', '--quiet']).returncode
+                  if changed == 0:
+                      return
+                  if changed != 1:
+                      raise RuntimeError('Could not inspect quota state')
+                  subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+                  subprocess.run(['git', 'config', 'user.email', 'github-actions[bot]@users.noreply.github.com'], check=True)
+                  subprocess.run(['git', 'commit', '-m', 'chore: record quota check state'], check=True)
+                  for attempt in range(3):
+                      if subprocess.run(['git', 'pull', '--rebase', '--autostash']).returncode == 0:
+                          if subprocess.run(['git', 'push']).returncode == 0:
+                              return
+                      if attempt < 2:
+                          time.sleep(3)
+                  raise RuntimeError('Could not persist quota state')
+              check(read_limits(), state, save, request_hi,
+                    interval=int(os.environ.get('CHECK_INTERVAL_SECONDS', '1800')),
+                    check_only=os.environ.get('CHECK_ONLY') == 'true')
+
+
+          if __name__ == '__main__':
+              main()
+          PY
+
+      - name: Persist refreshed authentication
+        if: ${{ always() && steps.restore.outcome == 'success' && env.GH_PAT != '' }}
         env:
           GH_TOKEN: ${{ env.GH_PAT }}
         run: |
           gh secret set CODEX_AUTH_JSON --repo "${{ github.repository }}" < "$HOME/.codex/auth.json"
-
-      - name: Record successful request time
-        if: ${{ !cancelled() && steps.warm.outcome == 'success' }}
-        env:
-          SENT_AT: ${{ steps.warm.outputs.sent_at }}
-        run: |
-          case "$SENT_AT" in
-            (''|*[!0-9]*) echo "::error::Missing successful request timestamp."; exit 1 ;;
-          esac
-          mkdir -p .state
-          printf '%s\n' "$SENT_AT" > .state/codex-last-warm.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .state/codex-last-warm.txt
-          git commit -m "chore: record successful connection request"
-          for attempt in 1 2 3; do
-            if git pull --rebase --autostash && git push; then
-              echo "- Successful request timestamp: saved to repository." >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            if [ "$attempt" -lt 3 ]; then sleep 3; fi
-          done
-          echo "::error::Could not save the successful request timestamp."
-          exit 1
-
-      - name: Report authentication persistence failure
-        if: ${{ !cancelled() && steps.persist_auth.outcome == 'failure' }}
-        run: |
-          echo "::error::Could not save refreshed credentials; check the persistence step."
-          echo "- Authentication persistence: failed; maintenance is required." >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-
-  heartbeat:
-    needs: [warm-codex]
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Commit timestamp (once per UTC day)
-        run: |
-          today=$(date -u +%F)
-          if [ "$(cut -c1-10 heartbeat.txt 2>/dev/null)" = "$today" ]; then
-            echo "Heartbeat already recorded today; skipping."
-            exit 0
-          fi
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add heartbeat.txt
-          git commit -m "chore: daily heartbeat"
-          for attempt in 1 2 3; do
-            if git pull --rebase --autostash && git push; then exit 0; fi
-            if [ "$attempt" -lt 3 ]; then sleep 3; fi
-          done
-          echo "::error::Could not save the daily heartbeat."
-          exit 1
