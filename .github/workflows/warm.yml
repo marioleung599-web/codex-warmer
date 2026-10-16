@@ -46,11 +46,13 @@ jobs:
           node --input-type=module <<'JS'
           import { spawn, execFile } from 'node:child_process';
           import { createInterface } from 'node:readline';
-          import { promisify } from 'node:util';
           import { setTimeout as sleep } from 'node:timers/promises';
           import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 
-          const exec = promisify(execFile);
+          export const exec = (file, args, options) => new Promise((resolve, reject) => {
+            const child = execFile(file, args, options, (error, stdout) => error ? reject(error) : resolve({ stdout }));
+            child.stdin.end();
+          });
           const WINDOW = 5 * 60 * 60;
           const INTERVAL = 30 * 60;
           const STATE = '.state/last-activation.json';
