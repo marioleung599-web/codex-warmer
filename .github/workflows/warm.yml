@@ -1,34 +1,24 @@
 name: codex-window-warmer
 
 # Adapted from viseshb/claude-codex-warmer (MIT).
-# Codex only; serialized runs; at least 5h01m between scheduled sends.
+# Check every 30 minutes; send when the last successful request is >= 5 hours old.
 on:
   schedule:
-    # Every 30 min, 24/7 — the elapsed-time gate limits real sends to ~5/day.
-    # Offset from :00/:30 on purpose: those are GitHub's most congested cron
-    # minutes and jobs scheduled there get delayed/skipped the most.
-    - cron: "7,37 * * * *"
-  workflow_dispatch:           # manual "Run workflow" button - always sends for real
+    - cron: "11,41 * * * *"
+  workflow_dispatch:
+    inputs:
+      check_only:
+        description: "Only check the five-hour timer; do not send a request"
+        required: false
+        default: false
+        type: boolean
 
-# Least privilege by default; jobs that need more elevate individually.
 permissions:
   contents: read
 
 env:
-  # Fallback-gate minimum seconds between real warms: 5h + 1min safety margin,
-  # so a send can never land inside the previous still-active window (which
-  # would be wasted and would NOT start a new window). Only used when the live
-  # usage meter is unreachable.
-  WARM_INTERVAL_SECONDS: "18060"
-  # Safety floor: if the live meter claims "cold" less than this many seconds
-  # after our own last send, distrust it and skip. A real window lasts 5h, so
-  # this can never block a legitimate re-warm; it only stops a broken meter
-  # (or a model that doesn't register on it) from causing a send every 30 min.
-  MIN_REWARM_SECONDS: "18060"
-  # Pinned CLI versions - last verified working. Bump intentionally, not
-  # silently via an unpinned `npm install -g <pkg>@latest`.
-# Claude removed: Codex-only configuration.
-  CODEX_CLI_VERSION: "0.144.1"   # gpt-5.6-sol needs >= 0.144
+  WARM_INTERVAL_SECONDS: "18000"
+  CODEX_CLI_VERSION: "0.144.1"
 
 concurrency:
   group: codex-window-warmer
@@ -45,75 +35,67 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check five-hour timer
+        id: check
+        env:
+          CHECK_ONLY: ${{ inputs.check_only || false }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          now=$(date +%s)
+          last=0
+          if [ -f .state/codex-last-warm.txt ]; then
+            last=$(cat .state/codex-last-warm.txt)
+            case "$last" in
+              (''|*[!0-9]*) echo "::error::Invalid last-send timestamp; refusing to send."; exit 1 ;;
+            esac
+          fi
+          if [ "$last" -gt "$now" ]; then
+            echo "::error::Last-send timestamp is in the future; refusing to send."
+            exit 1
+          fi
+          elapsed=$((now - last))
+          remaining=$((WARM_INTERVAL_SECONDS - elapsed))
+          send=false
+          if [ "$remaining" -le 0 ]; then
+            remaining=0
+            reason="Five hours elapsed; request is due."
+            if [ "$CHECK_ONLY" = "true" ]; then
+              reason="Request is due, but this is a check-only run."
+            else
+              send=true
+            fi
+          else
+            reason="Waiting: ${remaining}s remain until the next request."
+          fi
+          echo "$reason"
+          echo "send=$send" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Connection check"
+            echo "- Trigger: $TRIGGER"
+            echo "- Checked at: $(TZ=Asia/Shanghai date '+%F %T %Z')"
+            echo "- Schedule: every hour at :11 and :41 (GitHub may delay scheduling)."
+            echo "- Minimum request interval: 18000 seconds / 5 hours."
+            if [ "$last" -gt 0 ]; then
+              echo "- Last successful request: $(TZ=Asia/Shanghai date -d "@$last" '+%F %T %Z')"
+              echo "- Elapsed: ${elapsed}s."
+            else
+              echo "- Last successful request: none recorded."
+            fi
+            echo "- Decision: $reason"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Restore Codex auth
+        if: steps.check.outputs.send == 'true'
         env:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
         run: |
           if [ -z "$CODEX_AUTH_JSON" ] || [ -z "$GH_PAT" ]; then
-            echo "Configure CODEX_AUTH_JSON and GH_PAT before enabling warm-up."
+            echo "::error::Configure CODEX_AUTH_JSON and GH_PAT."
             exit 1
           fi
           mkdir -p "$HOME/.codex"
           printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
           chmod 600 "$HOME/.codex/auth.json"
-
-      - name: Check if a window is already running
-        id: check
-        run: |
-          send=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual run - sending regardless of window state."
-            send=true
-          fi
-
-          now=$(date +%s)
-          last=$(cat .state/codex-last-warm.txt 2>/dev/null || echo 0)
-          case "$last" in (''|*[!0-9]*) last=0 ;; esac
-          elapsed=$(( now - last ))
-
-          # Primary gate: the account's real usage meter. When nothing has
-          # been metered recently, reset_after_seconds sits at the full
-          # window length and slides forward; an active window pins it lower.
-          if [ -z "$send" ]; then
-            usage=$(curl -sf --max-time 30 https://chatgpt.com/backend-api/wham/usage \
-              -H "Authorization: Bearer $(jq -r '.tokens.access_token' "$HOME/.codex/auth.json")" \
-              -H "chatgpt-account-id: $(jq -r '.tokens.account_id' "$HOME/.codex/auth.json")" || true)
-            if printf '%s' "$usage" | jq -e '.rate_limit.primary_window.reset_after_seconds' >/dev/null 2>&1; then
-              reset_after=$(printf '%s' "$usage" | jq -r '.rate_limit.primary_window.reset_after_seconds')
-              window=$(printf '%s' "$usage" | jq -r '.rate_limit.primary_window.limit_window_seconds // 18000')
-              weekly_used=$(printf '%s' "$usage" | jq -r '.rate_limit.secondary_window.used_percent // 0')
-              if [ "$window" -ne 18000 ]; then
-                echo "Account has no five-hour primary window - skipping."
-                send=false
-              elif [ "$weekly_used" -ge 100 ]; then
-                echo "Weekly allowance exhausted - skipping."
-                send=false
-              elif [ "$reset_after" -lt $((window - 120)) ]; then
-                echo "Live meter: window active (resets in ${reset_after}s) - skipping."
-                send=false
-              elif [ "$elapsed" -lt "$MIN_REWARM_SECONDS" ]; then
-                echo "Live meter says cold but we sent ${elapsed}s ago - skipping (safety floor)."
-                send=false
-              else
-                echo "Live meter: no active window - warming."
-                send=true
-              fi
-            else
-              echo "Live meter unavailable - falling back to state file."
-            fi
-          fi
-
-          # Fallback gate: our own last-send timestamp.
-          if [ -z "$send" ]; then
-            if [ "$elapsed" -lt "$WARM_INTERVAL_SECONDS" ]; then
-              echo "State file: warmed ${elapsed}s ago (< ${WARM_INTERVAL_SECONDS}s) - skipping."
-              send=false
-            else
-              echo "State file: last warm ${elapsed}s ago - warming."
-              send=true
-            fi
-          fi
-          echo "send=$send" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         if: steps.check.outputs.send == 'true'
@@ -125,78 +107,96 @@ jobs:
         run: npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 
       - name: Send warm-up prompt
+        id: warm
         if: steps.check.outputs.send == 'true'
         run: |
-          # NOT the mini model: gpt-5.4-mini bills a separate bucket and does
-          # not register on the account's 5h window meter at all, so a mini
-          # "hi" never starts a window (verified empirically 2026-07-10).
-          # The warm must use the same metered model the apps use.
-          for i in 1 2 3; do
-            codex exec --ephemeral --sandbox read-only --skip-git-repo-check -m gpt-5.6-sol \
-              -c model_reasoning_effort="low" "Reply only with hi. Do not use tools or read any files." && exit 0
-            echo "Attempt $i failed, retrying in 10s..."
-            sleep 10
+          reply_file=$(mktemp)
+          trap 'rm -f "$reply_file"' EXIT
+          for attempt in 1 2 3; do
+            started=$(date +%s)
+            if codex exec --ephemeral --sandbox read-only --skip-git-repo-check -m gpt-5.6-sol \
+              -c model_reasoning_effort="low" "Reply only with hi. Do not use tools or read any files." > "$reply_file"; then
+              cat "$reply_file"
+              reply=$(tr -d '\r\n' < "$reply_file")
+              if [ "$reply" = "hi" ]; then
+                echo "sent_at=$started" >> "$GITHUB_OUTPUT"
+                echo "- Request: succeeded; response was hi." >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "::warning::Request returned an unexpected response."
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Attempt $attempt failed; retrying in 10 seconds."
+              sleep 10
+            fi
           done
-          echo "All 3 attempts failed."
+          echo "::error::All three request attempts failed."
           exit 1
 
       - name: Persist refreshed auth back to secret (best-effort)
-        if: ${{ always() && steps.check.outputs.send == 'true' && env.GH_PAT != '' }}
+        id: persist_auth
+        if: ${{ always() && steps.check.outputs.send == 'true' && steps.warm.outcome != 'skipped' && env.GH_PAT != '' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.GH_PAT }}
         run: |
-          # Codex may have rotated the refresh token during the run.
-          # Push the updated auth.json back so the next cron run authenticates.
-          gh secret set CODEX_AUTH_JSON \
-            --repo "${{ github.repository }}" \
-            < "$HOME/.codex/auth.json"
+          gh secret set CODEX_AUTH_JSON --repo "${{ github.repository }}" < "$HOME/.codex/auth.json"
 
-      - name: Record warm timestamp
-        if: steps.check.outputs.send == 'true'
+      - name: Record successful request time
+        if: ${{ !cancelled() && steps.warm.outcome == 'success' }}
+        env:
+          SENT_AT: ${{ steps.warm.outputs.sent_at }}
         run: |
+          case "$SENT_AT" in
+            (''|*[!0-9]*) echo "::error::Missing successful request timestamp."; exit 1 ;;
+          esac
           mkdir -p .state
-          date +%s > .state/codex-last-warm.txt
-          git config user.name  "github-actions[bot]"
+          printf '%s\n' "$SENT_AT" > .state/codex-last-warm.txt
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .state/codex-last-warm.txt
-          git commit -m "chore: warm codex $(TZ='Asia/Shanghai' date '+%F %H:%M %Z')" || exit 0
-          for i in 1 2 3; do
-            git pull --rebase --autostash && git push && break
-            sleep $((RANDOM % 5 + 1))
+          git commit -m "chore: record successful connection request"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash && git push; then
+              echo "- Successful request timestamp: saved to repository." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then sleep 3; fi
           done
+          echo "::error::Could not save the successful request timestamp."
+          exit 1
 
-  # --------------------------------------------------------------------------
-  # Notify — the only time you should ever need to look at this repo. If a
-  # warm job fails (all 3 retries exhausted - a real auth/CLI problem, not a
-  # blip), open one GitHub issue with the exact fix. GitHub emails repo
-  # owners on new issues/comments by default, so this reaches you without
-  # anyone polling Actions. Once things succeed again, auto-close it.
+      - name: Report authentication persistence failure
+        if: ${{ !cancelled() && steps.persist_auth.outcome == 'failure' }}
+        run: |
+          echo "::error::Could not save refreshed credentials; check the persistence step."
+          echo "- Authentication persistence: failed; maintenance is required." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
   heartbeat:
     needs: [warm-codex]
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
-      - name: Commit timestamp (once per day)
+      - name: Commit timestamp (once per UTC day)
         run: |
           today=$(date -u +%F)
           if [ "$(cut -c1-10 heartbeat.txt 2>/dev/null)" = "$today" ]; then
-            echo "Heartbeat already committed today ($today) - skipping."
+            echo "Heartbeat already recorded today; skipping."
             exit 0
           fi
           date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add heartbeat.txt
-          git commit -m "chore: heartbeat $(cat heartbeat.txt)" || exit 0
-          for i in 1 2 3; do
-            git pull --rebase --autostash && git push && break
-            sleep $((RANDOM % 5 + 1))
+          git commit -m "chore: daily heartbeat"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash && git push; then exit 0; fi
+            if [ "$attempt" -lt 3 ]; then sleep 3; fi
           done
-
-
+          echo "::error::Could not save the daily heartbeat."
+          exit 1
