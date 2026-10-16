@@ -117,8 +117,8 @@ jobs:
                 : { due: checkedAt, reason: 'The server reset time has passed; activate now.' };
             // Compare with the current SERVER window, never with last activation + five hours.
             const alreadyActivated = activatedAt >= quota.resetAt - WINDOW;
-            // On the first run, 0% used and approximately five hours remaining identifies a fresh window.
-            const fresh = quota.usedPercent === 0 && Math.abs(remaining - WINDOW) <= 120;
+            // A window opened during the latest check interval is fresh, even if already used elsewhere.
+            const fresh = remaining >= WINDOW - INTERVAL && remaining <= WINDOW;
             if (!alreadyActivated && (activatedAt > 0 || fresh))
               return { due: checkedAt, reason: 'A new quota window is available; activate now.' };
             if (remaining <= INTERVAL)
