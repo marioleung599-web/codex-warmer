@@ -13,8 +13,6 @@
 
 ## 配置与维护
 
-`CODEX_AUTH_JSON` 保存账号登录资料，`GH_PAT` 用于将刷新的登录资料保存回仓库加密项。
-
 在 Actions 页面查看运行日志；通过工作流菜单的 Disable workflow 暂停，Enable workflow 恢复。GitHub 定时调度可能延迟。
 
 实现及依赖版本见 [warm.yml](.github/workflows/warm.yml)。
