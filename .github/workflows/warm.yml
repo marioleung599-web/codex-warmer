@@ -1,7 +1,7 @@
 name: codex-window-warmer
 
 # Adapted from viseshb/claude-codex-warmer (MIT).
-# Check real quota every 30 minutes; when reset is near, wait until reset + 60s.
+# Read real quota every 30 minutes; an upcoming reset is activated at reset + 60s.
 on:
   schedule:
     - cron: "11,41 * * * *"
@@ -17,18 +17,16 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: write
-    env:
-      GH_PAT: ${{ secrets.GH_PAT }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore Codex auth
+      - name: Restore Codex authentication
         id: restore
         env:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
         run: |
-          if [ -z "$CODEX_AUTH_JSON" ] || [ -z "$GH_PAT" ]; then
-            echo "::error::Configure CODEX_AUTH_JSON and GH_PAT."
+          if [ -z "$CODEX_AUTH_JSON" ]; then
+            echo "::error::CODEX_AUTH_JSON is missing."
             exit 1
           fi
           mkdir -p "$HOME/.codex"
@@ -43,231 +41,156 @@ jobs:
       - name: Install official Codex CLI
         run: npm install -g @openai/codex@0.144.1
 
-      - name: Check real quota and activate after reset
+      - name: Check quota and activate when due
         run: |
-          python - <<'PY'
-          """Check the real quota; wait only when its reset is within one check interval."""
-          import json
-          import os
-          from pathlib import Path
-          import queue
-          import subprocess
-          import threading
-          import time
+          node --input-type=module <<'JS'
+          import { spawn, execFile } from 'node:child_process';
+          import { createInterface } from 'node:readline';
+          import { promisify } from 'node:util';
+          import { setTimeout as sleep } from 'node:timers/promises';
+          import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 
+          const exec = promisify(execFile);
+          const WINDOW = 5 * 60 * 60;
+          const INTERVAL = 30 * 60;
+          const STATE = '.state/last-activation.json';
+          const now = () => Date.now() / 1000;
+          const stamp = seconds => new Date(seconds * 1000).toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }) + ' GMT+8';
 
-          class LimitsClient:
-              def __init__(self):
-                  self.proc = subprocess.Popen(['codex', 'app-server'], stdin=subprocess.PIPE,
-                                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                               text=True, bufsize=1)
-                  self.responses = queue.Queue()
-                  self.sequence = 0
-                  def read():
-                      for line in self.proc.stdout:
-                          try:
-                              message = json.loads(line)
-                          except ValueError:
-                              continue
-                          if 'id' in message:
-                              self.responses.put(message)
-                      self.responses.put(None)
-                  threading.Thread(target=read, daemon=True).start()
+          function report(message) {
+            console.log(message);
+            if (process.env.GITHUB_STEP_SUMMARY)
+              appendFileSync(process.env.GITHUB_STEP_SUMMARY, '- ' + message + '\n');
+          }
 
-              def rpc(self, method, params=None):
-                  self.sequence += 1
-                  message = {'id': self.sequence, 'method': method}
-                  if params is not None:
-                      message['params'] = params
-                  self.proc.stdin.write(json.dumps(message) + '\n')
-                  self.proc.stdin.flush()
-                  until = time.monotonic() + 60
-                  while True:
-                      remaining = until - time.monotonic()
-                      if remaining <= 0:
-                          raise RuntimeError('Account quota query timed out')
-                      try:
-                          response = self.responses.get(timeout=remaining)
-                      except queue.Empty:
-                          raise RuntimeError('Account quota query timed out') from None
-                      if response is None:
-                          raise RuntimeError('Account quota client stopped')
-                      if response.get('id') != self.sequence:
-                          continue
-                      if 'error' in response:
-                          raise RuntimeError('Account quota query failed: ' + method)
-                      return response['result']
+          export function parseQuota(result) {
+            const limits = result.rateLimitsByLimitId ? result.rateLimitsByLimitId.codex : result.rateLimits;
+            const primary = limits?.primary;
+            if (primary?.windowDurationMins !== 300 || !Number.isInteger(primary.resetsAt) || primary.resetsAt <= 0 ||
+                !Number.isFinite(primary.usedPercent) || primary.usedPercent < 0 || primary.usedPercent > 100)
+              throw new Error('Missing valid five-hour Codex quota; refusing to guess a reset time.');
+            return { resetAt: primary.resetsAt, usedPercent: primary.usedPercent };
+          }
 
-              def read(self):
-                  self.rpc('initialize', {'clientInfo': {'name': 'codex_quota_check', 'version': '1.0.0'}})
-                  self.proc.stdin.write(json.dumps({'method': 'initialized', 'params': {}}) + '\n')
-                  self.proc.stdin.flush()
-                  result = self.rpc('account/rateLimits/read')
-                  buckets = result.get('rateLimitsByLimitId')
-                  limits = buckets.get('codex', {}) if buckets else result.get('rateLimits', {})
-                  primary = (limits or {}).get('primary') or {}
-                  if primary.get('windowDurationMins') != 300:
-                      raise RuntimeError('The server did not return a five-hour Codex quota')
-                  reset, used = primary.get('resetsAt'), primary.get('usedPercent')
-                  if isinstance(reset, bool) or not isinstance(reset, (int, float)) or reset <= 0:
-                      raise RuntimeError('Missing valid server reset time; no fallback request will be sent')
-                  if isinstance(used, bool) or not isinstance(used, (int, float)) or not 0 <= used <= 100:
-                      raise RuntimeError('Missing valid quota percentage')
-                  return {'resetAt': int(reset), 'usedPercent': used}
+          function readQuota() {
+            return new Promise((resolve, reject) => {
+              const child = spawn('codex', ['app-server'], { stdio: ['pipe', 'pipe', 'ignore'] });
+              const lines = createInterface({ input: child.stdout });
+              let done = false;
+              const timer = setTimeout(() => finish(new Error('Account quota query timed out.')), 60000);
+              function finish(error, value) {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                lines.close();
+                child.kill();
+                const cleanup = setTimeout(() => child.kill('SIGKILL'), 5000);
+                cleanup.unref();
+                child.once('exit', () => clearTimeout(cleanup));
+                error ? reject(error) : resolve(value);
+              }
+              const write = message => child.stdin.write(JSON.stringify(message) + '\n');
+              child.on('error', finish);
+              child.stdin.on('error', finish);
+              child.on('exit', () => finish(new Error('Account quota client stopped.')));
+              lines.on('line', line => {
+                let message;
+                try { message = JSON.parse(line); } catch { return; }
+                if (done || (message.id !== 1 && message.id !== 2)) return;
+                if (message.error) return finish(new Error('Account quota request failed.'));
+                if (message.id === 1) {
+                  write({ method: 'initialized', params: {} });
+                  write({ id: 2, method: 'account/rateLimits/read' });
+                } else {
+                  try { finish(null, parseQuota(message.result)); } catch (error) { finish(error); }
+                }
+              });
+              write({ id: 1, method: 'initialize', params: { clientInfo: { name: 'codex_quota_check', version: '1.0.0' } } });
+            });
+          }
 
-              def close(self):
-                  if self.proc.poll() is None:
-                      self.proc.terminate()
-                  try:
-                      self.proc.wait(timeout=5)
-                  except subprocess.TimeoutExpired:
-                      self.proc.kill()
-                      self.proc.wait()
+          export function decide(quota, activatedAt, checkedAt) {
+            const remaining = quota.resetAt - checkedAt;
+            if (remaining <= 0)
+              return activatedAt >= quota.resetAt
+                ? { due: null, reason: 'This reset was already activated; server metadata is stale.' }
+                : { due: checkedAt, reason: 'The server reset time has passed; activate now.' };
+            // Compare with the current SERVER window, never with last activation + five hours.
+            const alreadyActivated = activatedAt >= quota.resetAt - WINDOW;
+            // On the first run, 0% used and approximately five hours remaining identifies a fresh window.
+            const fresh = quota.usedPercent === 0 && Math.abs(remaining - WINDOW) <= 120;
+            if (!alreadyActivated && (activatedAt > 0 || fresh))
+              return { due: checkedAt, reason: 'A new quota window is available; activate now.' };
+            if (remaining <= INTERVAL)
+              return { due: quota.resetAt + 60, reason: 'Reset is within 30 minutes; activate at reset plus one minute.' };
+            return { due: null, reason: 'No activation is due; wait for the next scheduled check.' };
+          }
 
+          async function retry(label, action) {
+            for (let attempt = 1; ; attempt++) {
+              try { return await action(); }
+              catch (error) {
+                if (attempt === 3) throw error;
+                report(label + ' failed; retrying in 10 seconds.');
+                await sleep(10000);
+              }
+            }
+          }
 
-          def read_limits():
-              client = LimitsClient()
-              try:
-                  return client.read()
-              finally:
-                  client.close()
+          async function saveActivation(completedAt) {
+            mkdirSync('.state', { recursive: true });
+            writeFileSync(STATE, JSON.stringify(completedAt) + '\n');
+            const git = (...args) => exec('git', args, { timeout: 30000 });
+            await git('config', 'user.name', 'github-actions[bot]');
+            await git('config', 'user.email', 'github-actions[bot]@users.noreply.github.com');
+            await git('add', STATE);
+            await git('commit', '-m', 'chore: record successful activation');
+            await retry('Saving activation', async () => {
+              await git('pull', '--rebase');
+              await git('push');
+            });
+          }
 
+          export async function run(quota, activatedAt, { clock = now, wait = sleep, send, save, log = report }) {
+            const checkedAt = clock();
+            const { due, reason } = decide(quota, activatedAt, checkedAt);
+            log('Checked at: ' + stamp(checkedAt));
+            log('Five-hour quota remaining: ' + (100 - quota.usedPercent) + '%');
+            log('Server reset time: ' + stamp(quota.resetAt));
+            log('Decision: ' + reason);
+            if (due === null) return 'skip';
+            log('Request scheduled for: ' + stamp(due));
+            await wait(Math.max(0, due - clock()) * 1000);
+            await send();
+            const completedAt = clock();
+            await save(completedAt);
+            log('Activation succeeded at: ' + stamp(completedAt));
+            return 'sent';
+          }
 
-          def stamp(value):
-              from datetime import datetime, timezone, timedelta
-              return datetime.fromtimestamp(value, timezone(timedelta(hours=8))).strftime('%F %T GMT+8')
+          export async function main() {
+            const activatedAt = existsSync(STATE) ? JSON.parse(readFileSync(STATE, 'utf8')) : 0;
+            if (!Number.isFinite(activatedAt) || activatedAt < 0 || activatedAt > now())
+              throw new Error('Invalid successful activation record.');
+            await run(await readQuota(), activatedAt, {
+              save: saveActivation,
+              send: async () => {
+                const result = await retry('Activation request', () => exec('codex', [
+                  'exec', '--ephemeral', '--sandbox', 'read-only', '--skip-git-repo-check',
+                  '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="low"',
+                  'Reply only with hi. Do not use tools or read any files.'
+                ], { timeout: 120000 }));
+                report('Response: ' + (result.stdout.trim().slice(0, 200) || '[empty response]'));
+              }
+            });
+          }
+          await main();
+          JS
 
-
-          def report(message):
-              print(message, flush=True)
-              summary = os.environ.get('GITHUB_STEP_SUMMARY')
-              if summary:
-                  with open(summary, 'a', encoding='utf-8') as handle:
-                      handle.write('- ' + message + '\n')
-
-
-          def decide(limits, state, now, interval):
-              reset = limits['resetAt']
-              remaining = reset - now
-              observed = state.get('observedResetAt', 0)
-              handled = state.get('handledResetAt', 0)
-              activated = state.get('activatedWindowResetAt', 0)
-              if reset <= now:
-                  if reset <= handled:
-                      return None, 'This reset was already handled; server metadata has not advanced.'
-                  return now, 'The server reset time has passed; send now.'
-              if handled < observed <= now:
-                  return now, 'The previously observed server reset has passed and a new window is reported; send now.'
-              # A tiny request may round to 0% used. Remember the activated window so a
-              # manual rerun cannot activate that same full-looking window again.
-              if limits['usedPercent'] == 0 and abs(remaining - 18000) <= 120:
-                  if reset == activated:
-                      return None, 'This quota window was already activated.'
-                  return now, 'Quota is 100% available and the next reset is about five hours away; send now.'
-              if remaining <= interval:
-                  return reset + 60, 'Reset is within one check interval; wait until reset plus one minute.'
-              return None, 'Reset is more than one check interval away; finish and wait for the next scheduled check.'
-
-
-          def check(limits, state, save, send, now=time.time, sleep=time.sleep,
-                    interval=1800, read_after=read_limits, emit=report):
-              checked_at = now()
-              due, reason = decide(limits, state, checked_at, interval)
-              emit('Checked at: ' + stamp(checked_at))
-              emit('Five-hour quota remaining: ' + str(100 - limits['usedPercent']) + '%')
-              emit('Server reset time: ' + stamp(limits['resetAt']))
-              emit('Seconds until reset: ' + str(round(limits['resetAt'] - checked_at)))
-              emit('Decision: ' + reason)
-              if due is not None:
-                  emit('Request scheduled for: ' + stamp(due))
-              previous_reset = state.get('observedResetAt', 0)
-              state['observedResetAt'] = limits['resetAt']
-              if due is None:
-                  if previous_reset != limits['resetAt']:
-                      save()
-                  return 'skip'
-              # One short-lived run sleeps at most one interval plus 60 seconds. It does
-              # not dispatch another workflow or keep a five-hour resident process.
-              while True:
-                  remaining = due - now()
-                  if remaining <= 0:
-                      break
-                  sleep(remaining)
-              emit('Starting the activation request at ' + stamp(now()))
-              sent_at = send()
-              if limits['resetAt'] <= sent_at:
-                  state['handledResetAt'] = limits['resetAt']
-              elif previous_reset and previous_reset <= sent_at:
-                  state['handledResetAt'] = max(state.get('handledResetAt', 0), previous_reset)
-              state['activatedWindowResetAt'] = limits['resetAt']
-              emit('Activation request succeeded.')
-              try:
-                  updated = read_after()
-                  state['observedResetAt'] = updated['resetAt']
-                  state['activatedWindowResetAt'] = updated['resetAt']
-                  emit('Next server reset time: ' + stamp(updated['resetAt']))
-              finally:
-                  # Save once, including the successful activation if the follow-up query fails.
-                  save()
-              return 'sent'
-
-
-          def request_hi():
-              for attempt in range(3):
-                  started = time.time()
-                  try:
-                      result = subprocess.run(['codex', 'exec', '--ephemeral', '--sandbox', 'read-only',
-                          '--skip-git-repo-check', '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="low"',
-                          'Reply only with hi. Do not use tools or read any files.'],
-                          stdout=subprocess.PIPE, text=True, timeout=120)
-                  except subprocess.TimeoutExpired:
-                      result = None
-                  if result is not None and result.returncode == 0:
-                      report('Response: ' + (result.stdout.strip()[:200] or '[empty response]'))
-                      return started
-                  if attempt < 2:
-                      report('Request failed; retrying in 10 seconds.')
-                      time.sleep(10)
-              raise RuntimeError('All three activation request attempts failed')
-
-
-          def main():
-              path = Path('.state/codex-quota-check.json')
-              state = json.loads(path.read_text()) if path.exists() else {}
-              for key in ('observedResetAt', 'handledResetAt', 'activatedWindowResetAt'):
-                  value = state.get(key, 0)
-                  if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                      raise RuntimeError('Invalid saved quota state')
-              def save():
-                  path.parent.mkdir(parents=True, exist_ok=True)
-                  path.write_text(json.dumps(state, indent=2) + '\n', encoding='utf-8')
-                  subprocess.run(['git', 'add', str(path)], check=True)
-                  changed = subprocess.run(['git', 'diff', '--cached', '--quiet']).returncode
-                  if changed == 0:
-                      return
-                  if changed != 1:
-                      raise RuntimeError('Could not inspect quota state')
-                  subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
-                  subprocess.run(['git', 'config', 'user.email', 'github-actions[bot]@users.noreply.github.com'], check=True)
-                  subprocess.run(['git', 'commit', '-m', 'chore: record quota check state'], check=True)
-                  for attempt in range(3):
-                      if subprocess.run(['git', 'pull', '--rebase', '--autostash']).returncode == 0:
-                          if subprocess.run(['git', 'push']).returncode == 0:
-                              return
-                      if attempt < 2:
-                          time.sleep(3)
-                  raise RuntimeError('Could not persist quota state')
-              check(read_limits(), state, save, request_hi)
-
-
-          if __name__ == '__main__':
-              main()
-          PY
-
-      - name: Persist refreshed authentication
+      - name: Save authentication only if refreshed
         if: ${{ always() && steps.restore.outcome == 'success' }}
         env:
-          GH_TOKEN: ${{ env.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           ORIGINAL_AUTH_SHA: ${{ steps.restore.outputs.auth_sha }}
         run: |
           current_sha=$(sha256sum "$HOME/.codex/auth.json" | cut -d ' ' -f 1)
