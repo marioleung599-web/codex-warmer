@@ -50,7 +50,8 @@ jobs:
           import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 
           export const exec = (file, args, options) => new Promise((resolve, reject) => {
-            const child = execFile(file, args, options, (error, stdout) => error ? reject(error) : resolve({ stdout }));
+            const child = execFile(file, args, options, (error, stdout) =>
+              error || child.killed ? reject(error || new Error('Command timed out.')) : resolve({ stdout }));
             child.stdin.end();
           });
           const WINDOW = 5 * 60 * 60;
@@ -177,12 +178,15 @@ jobs:
             await run(await readQuota(), activatedAt, {
               save: saveActivation,
               send: async () => {
-                const result = await retry('Activation request', () => exec('codex', [
-                  'exec', '--ephemeral', '--sandbox', 'read-only', '--skip-git-repo-check',
-                  '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="low"',
-                  'Reply only with hi. Do not use tools or read any files.'
-                ], { timeout: 120000 }));
-                report('Response: ' + (result.stdout.trim().slice(0, 200) || '[empty response]'));
+                await retry('Activation request', async () => {
+                  const result = await exec('codex', [
+                    'exec', '--ephemeral', '--sandbox', 'read-only', '--skip-git-repo-check',
+                    '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort="low"',
+                    'Reply only with hi. Do not use tools or read any files.'
+                  ], { timeout: 120000 });
+                  if (!result.stdout.trim()) throw new Error('Codex returned no reply.');
+                  report('Response: ' + result.stdout.trim().slice(0, 200));
+                });
               }
             });
           }
