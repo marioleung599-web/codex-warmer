@@ -1,18 +1,24 @@
 # 定时连接检查
 
-一个用于验证定时执行、服务连接和状态记录的小型自动化示例。
+通过 GitHub Actions 定时查询账号状态，按剩余时间执行轻量请求。
 
-## 运行方式
+## 运行规则
 
-- 定期检查运行状态，按条件执行轻量请求。
-- 记录执行时间，避免短时间重复运行。
-- 支持手动执行，并保留运行日志。
-- 具体依赖和参数见 `.github/workflows/warm.yml`。
+- 每小时 11 分、41 分查询一次五小时额度的剩余重置时间。
+- 剩余时间大于或等于 4 小时 55 分钟时发送请求；小于该时间时结束本轮。
+- 手动运行直接发送请求。
+- 请求正常完成且收到非空回复，即认定成功并结束。
+- 查询和发送分别计数：失败后间隔 30 秒，最多重试 3 次，即每项最多尝试 4 次。
+- 查询最终失败时结束本轮；发送最终失败时结束本轮。
 
 ## 配置与维护
 
-在 Actions 页面查看执行结果；通过工作流菜单的 Disable workflow 暂停，Enable workflow 恢复。定时执行可能因平台调度而延迟。
+`CODEX_AUTH_JSON` 保存账号登录资料，`GH_PAT` 用于将刷新的登录资料保存回仓库加密项。
+
+在 Actions 页面查看运行日志；通过工作流菜单的 Disable workflow 暂停，Enable workflow 恢复。GitHub 定时调度可能延迟。
+
+实现及依赖版本见 [warm.yml](.github/workflows/warm.yml)。
 
 ## 许可证
 
-MIT，详见 [LICENSE](LICENSE)。
+基于 viseshb/claude-codex-warmer 改写，使用 MIT 许可证，详见 [LICENSE](LICENSE)。
