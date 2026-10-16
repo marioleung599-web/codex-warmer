@@ -6,19 +6,6 @@ on:
   schedule:
     - cron: "11,41 * * * *"
   workflow_dispatch:
-    inputs:
-      check_only:
-        description: "Only read quota and show the decision; do not wait or send a request"
-        required: false
-        default: false
-        type: boolean
-
-permissions:
-  contents: read
-
-env:
-  CHECK_INTERVAL_SECONDS: "1800"
-  CODEX_CLI_VERSION: "0.144.1"
 
 concurrency:
   group: codex-window-warmer
@@ -32,7 +19,6 @@ jobs:
       contents: write
     env:
       GH_PAT: ${{ secrets.GH_PAT }}
-      CHECK_ONLY: ${{ inputs.check_only || false }}
     steps:
       - uses: actions/checkout@v4
 
@@ -48,16 +34,16 @@ jobs:
           mkdir -p "$HOME/.codex"
           printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
           chmod 600 "$HOME/.codex/auth.json"
+          echo "auth_sha=$(sha256sum "$HOME/.codex/auth.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install official Codex CLI
-        run: npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
+        run: npm install -g @openai/codex@0.144.1
 
       - name: Check real quota and activate after reset
-        id: check
         run: |
           python - <<'PY'
           """Check the real quota; wait only when its reset is within one check interval."""
@@ -87,9 +73,6 @@ jobs:
                               self.responses.put(message)
                       self.responses.put(None)
                   threading.Thread(target=read, daemon=True).start()
-                  self.rpc('initialize', {'clientInfo': {'name': 'codex_quota_check', 'version': '1.0.0'}})
-                  self.proc.stdin.write(json.dumps({'method': 'initialized', 'params': {}}) + '\n')
-                  self.proc.stdin.flush()
 
               def rpc(self, method, params=None):
                   self.sequence += 1
@@ -116,6 +99,9 @@ jobs:
                       return response['result']
 
               def read(self):
+                  self.rpc('initialize', {'clientInfo': {'name': 'codex_quota_check', 'version': '1.0.0'}})
+                  self.proc.stdin.write(json.dumps({'method': 'initialized', 'params': {}}) + '\n')
+                  self.proc.stdin.flush()
                   result = self.rpc('account/rateLimits/read')
                   buckets = result.get('rateLimitsByLimitId')
                   limits = buckets.get('codex', {}) if buckets else result.get('rateLimits', {})
@@ -170,13 +156,13 @@ jobs:
                   if reset <= handled:
                       return None, 'This reset was already handled; server metadata has not advanced.'
                   return now, 'The server reset time has passed; send now.'
-              if observed > handled and observed <= now and reset != observed:
+              if handled < observed <= now:
                   return now, 'The previously observed server reset has passed and a new window is reported; send now.'
               # A tiny request may round to 0% used. Remember the activated window so a
               # manual rerun cannot activate that same full-looking window again.
-              if limits['usedPercent'] == 0 and abs(remaining - 18000) <= 120 and reset != activated:
-                  if observed and observed <= handled and observed < reset:
-                      return None, 'This newly reported window was already activated after its reset.'
+              if limits['usedPercent'] == 0 and abs(remaining - 18000) <= 120:
+                  if reset == activated:
+                      return None, 'This quota window was already activated.'
                   return now, 'Quota is 100% available and the next reset is about five hours away; send now.'
               if remaining <= interval:
                   return reset + 60, 'Reset is within one check interval; wait until reset plus one minute.'
@@ -184,7 +170,7 @@ jobs:
 
 
           def check(limits, state, save, send, now=time.time, sleep=time.sleep,
-                    interval=1800, check_only=False, read_after=read_limits, emit=report):
+                    interval=1800, read_after=read_limits, emit=report):
               checked_at = now()
               due, reason = decide(limits, state, checked_at, interval)
               emit('Checked at: ' + stamp(checked_at))
@@ -194,9 +180,6 @@ jobs:
               emit('Decision: ' + reason)
               if due is not None:
                   emit('Request scheduled for: ' + stamp(due))
-              if check_only:
-                  emit('Check-only run: no request, no waiting, no state change.')
-                  return 'check_only'
               previous_reset = state.get('observedResetAt', 0)
               state['observedResetAt'] = limits['resetAt']
               if due is None:
@@ -217,13 +200,15 @@ jobs:
               elif previous_reset and previous_reset <= sent_at:
                   state['handledResetAt'] = max(state.get('handledResetAt', 0), previous_reset)
               state['activatedWindowResetAt'] = limits['resetAt']
-              save()
-              emit('Request succeeded; response: hi.')
-              updated = read_after()
-              state['observedResetAt'] = updated['resetAt']
-              state['activatedWindowResetAt'] = updated['resetAt']
-              save()
-              emit('Next server reset time: ' + stamp(updated['resetAt']))
+              emit('Activation request succeeded.')
+              try:
+                  updated = read_after()
+                  state['observedResetAt'] = updated['resetAt']
+                  state['activatedWindowResetAt'] = updated['resetAt']
+                  emit('Next server reset time: ' + stamp(updated['resetAt']))
+              finally:
+                  # Save once, including the successful activation if the follow-up query fails.
+                  save()
               return 'sent'
 
 
@@ -237,7 +222,8 @@ jobs:
                           stdout=subprocess.PIPE, text=True, timeout=120)
                   except subprocess.TimeoutExpired:
                       result = None
-                  if result is not None and result.returncode == 0 and result.stdout.strip() == 'hi':
+                  if result is not None and result.returncode == 0:
+                      report('Response: ' + (result.stdout.strip()[:200] or '[empty response]'))
                       return started
                   if attempt < 2:
                       report('Request failed; retrying in 10 seconds.')
@@ -271,9 +257,7 @@ jobs:
                       if attempt < 2:
                           time.sleep(3)
                   raise RuntimeError('Could not persist quota state')
-              check(read_limits(), state, save, request_hi,
-                    interval=int(os.environ.get('CHECK_INTERVAL_SECONDS', '1800')),
-                    check_only=os.environ.get('CHECK_ONLY') == 'true')
+              check(read_limits(), state, save, request_hi)
 
 
           if __name__ == '__main__':
@@ -281,8 +265,14 @@ jobs:
           PY
 
       - name: Persist refreshed authentication
-        if: ${{ always() && steps.restore.outcome == 'success' && env.GH_PAT != '' }}
+        if: ${{ always() && steps.restore.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ env.GH_PAT }}
+          ORIGINAL_AUTH_SHA: ${{ steps.restore.outputs.auth_sha }}
         run: |
+          current_sha=$(sha256sum "$HOME/.codex/auth.json" | cut -d ' ' -f 1)
+          if [ "$current_sha" = "$ORIGINAL_AUTH_SHA" ]; then
+            echo "Authentication unchanged; no secret update needed."
+            exit 0
+          fi
           gh secret set CODEX_AUTH_JSON --repo "${{ github.repository }}" < "$HOME/.codex/auth.json"
