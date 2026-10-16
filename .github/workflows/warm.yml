@@ -50,20 +50,20 @@ jobs:
           import { setTimeout as sleep } from 'node:timers/promises';
 
           export async function retry(label, action, wait = sleep) {
+            let previousError;
             for (let attempt = 1; attempt <= 4; attempt++) {
-              try { return await action(); }
+              try { return await action(previousError); }
               catch (error) {
                 console.log(`${label}: attempt ${attempt}/4 failed.`);
                 if (attempt === 4) throw error;
+                previousError = error;
                 console.log('Retrying in 30 seconds.');
                 await wait(30000);
               }
             }
           }
 
-          export async function readQuota() {
-            const deadline = AbortSignal.timeout(60000);
-            // Let the official CLI maintain the managed login before reading its access token.
+          async function refreshLogin(deadline) {
             const child = childProcess.spawn('codex', ['app-server'], {
               stdio: ['pipe', 'pipe', 'ignore'], signal: deadline
             });
@@ -92,7 +92,12 @@ jobs:
               lines.close();
               child.kill('SIGKILL');
             }
+          }
 
+          export async function readQuota(previousError) {
+            const deadline = AbortSignal.timeout(60000);
+            // Recover an unauthorized query during its next already-scheduled retry.
+            if (previousError?.status === 401) await refreshLogin(deadline);
             let tokens;
             try { tokens = JSON.parse(fs.readFileSync(join(homedir(), '.codex', 'auth.json'), 'utf8')).tokens; }
             catch { throw new Error('Could not read Codex authentication.'); }
@@ -105,7 +110,8 @@ jobs:
                 'chatgpt-account-id': tokens.account_id
               }
             });
-            if (!response.ok) throw new Error(`Quota query failed: HTTP ${response.status}.`);
+            if (!response.ok)
+              throw Object.assign(new Error(`Quota query failed: HTTP ${response.status}.`), { status: response.status });
             const quota = (await response.json()).rate_limit?.primary_window;
             if (quota?.limit_window_seconds !== 18000 ||
                 !Number.isFinite(quota.reset_after_seconds) || quota.reset_after_seconds < 0)
